@@ -1,0 +1,290 @@
+import asyncio
+import logging
+import os
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import CommandStart
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, FSInputFile
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+
+# Налаштування логування
+logging.basicConfig(level=logging.INFO)
+
+TOKEN = '8932399009:AAFhOyDXngIW5cMWtDApAKPrhOY-0cgcSdA'
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
+
+# Створюємо папку для завантажених файлів, якщо її немає
+DOWNLOADS_DIR = "downloads"
+os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+
+
+# --- СТАНИ ДЛЯ ЗБОРУ ДАНИХ ТА ЗАВАНТАЖЕННЯ (FSM) ---
+class FormStates(StatesGroup):
+    waiting_for_name = State()  # Очікування ПІБ
+    waiting_for_message = State()  # Очікування тексту
+    waiting_for_file = State()  # Новий стан: Очікування файлу від користувача
+
+
+# --- КЛАВІАТУРИ ---
+
+main_menu = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="📅 Розклад екзаменів"), KeyboardButton(text="📅 Розклад"), KeyboardButton(text="📅 Військові збори")],
+        [KeyboardButton(text="📅 Зразок заяви студента"), KeyboardButton(text="📅 Зразок заяви батьків")],
+        [KeyboardButton(text="✍️ Залишити запит"), KeyboardButton(text="📁 Надіслати документ"), KeyboardButton(text="❓ Допомога")]  # Додали нову кнопку
+    ],
+    resize_keyboard=True
+)
+
+materials_menu = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="📑 2 курс"), KeyboardButton(text="📑 3 курс")],
+        [KeyboardButton(text="⬅️ В головне меню")]
+    ],
+    resize_keyboard=True
+)
+
+
+cancel_menu = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="❌ Скасувати")]],
+    resize_keyboard=True
+)
+
+
+# --- ОБРОБНИКИ НАВІГАЦІЇ ---
+
+@dp.message(CommandStart())
+async def cmd_start(message: types.Message):
+    await message.answer(
+        f"Вітаю, {message.from_user.full_name}! 👋\nЯ ваш бот-помічник. Оберіть потрібний розділ нижче:",
+        reply_markup=main_menu
+    )
+
+
+@dp.message(F.text.in_({"❓ Допомога", "/help"}))
+async def cmd_help(message: types.Message):
+    await message.answer("Цей бот створений для допомоги здобувачам освіти")
+
+@dp.message(F.text == "📅 Розклад екзаменів")
+async def show_materials_sections(message: types.Message):
+    await message.answer("Оберіть тип матеріалів:", reply_markup=materials_menu)
+
+
+@dp.message(F.text == "Кабінет")
+async def show_cabinet_sections(message: types.Message):
+    await message.answer("Оберіть документ кабінету:", reply_markup=materials_menu_1)
+
+
+@dp.message(F.text == "⬅️ В головне меню")
+@dp.message(F.text == "❌ Скасувати")
+async def go_to_main_menu(message: types.Message, state: FSMContext):
+    await state.clear()  # Про всяк випадок скидаємо стани, якщо користувач скасував дію
+    await message.answer("Повертаємось у головне меню", reply_markup=main_menu)
+
+
+@dp.message(F.text == "⬅️ Назад до матеріалів")
+async def go_to_materials(message: types.Message):
+    await message.answer("Повертаємось до матеріалів", reply_markup=materials_menu)
+
+
+# --- СЦЕНАРІЙ 1: ЗБИРАННЯ ТЕКСТОВОЇ ІНФОРМАЦІЇ ---
+
+@dp.message(F.text == "✍️ Залишити запит")
+async def start_feedback(message: types.Message, state: FSMContext):
+    await state.set_state(FormStates.waiting_for_name)
+    await message.answer("Будь ласка, вкажіть ваше ПІБ:", reply_markup=cancel_menu)
+
+
+@dp.message(FormStates.waiting_for_name)
+async def process_name(message: types.Message, state: FSMContext):
+    await state.update_data(user_name=message.text)
+    await state.set_state(FormStates.waiting_for_message)
+    await message.answer("Тепер напишіть ваш запит або інформацію:")
+
+
+@dp.message(FormStates.waiting_for_message)
+async def process_message(message: types.Message, state: FSMContext):
+    user_data = await state.get_data()
+    user_name = user_data.get("user_name")
+
+    await state.clear()
+    await message.answer("Дякуємо! Ваша інформація успішно збережена. 👍", reply_markup=main_menu)
+
+    print(f"\n[ЗАПИТ] {user_name} (ID: {message.from_user.id}): {message.text}\n")
+
+
+# --- СЦЕНАРІЙ 2: ЗАВАНТАЖЕННЯ ДОКУМЕНТІВ ВІД КОРИСТУВАЧА ---
+
+# 1. Користувач натискає кнопку завантаження файлу
+@dp.message(F.text == "📁 Надіслати документ")
+async def start_file_upload(message: types.Message, state: FSMContext):
+    await state.set_state(FormStates.waiting_for_file)
+    await message.answer(
+        "Будь ласка, надішліть файл (як документ або фото). "
+        "Я збережу його на сервері.",
+        reply_markup=cancel_menu
+    )
+
+
+# 2. Обробник, якщо користувач надіслав файл як "Документ" (без стиснення: pdf, docx, xlsx, zip тощо)
+@dp.message(FormStates.waiting_for_file, F.document)
+async def download_document(message: types.Message, state: FSMContext):
+    document = message.document
+    file_name = document.file_name or f"file_{document.file_unique_id}"
+
+    # Створюємо унікальний шлях, щоб файли з однаковими назвами не перезаписували один одного
+    file_path = os.path.join(DOWNLOADS_DIR, f"{message.from_user.id}_{file_name}")
+
+    # Отримуємо інформацію про файл від Telegram
+    file_info = await bot.get_file(document.file_id)
+
+    # Завантажуємо файл на сервер
+    await bot.download_file(file_info.file_path, destination=file_path)
+
+    await state.clear()  # Завершуємо стан
+    await message.answer(f"✅ Файл '{file_name}' успішно завантажено!", reply_markup=main_menu)
+    print(f"[ФАЙЛ ЗАВАНТАЖЕНО] Збережено у: {file_path}")
+
+
+# 3. Обробник, якщо користувач надіслав файл як звичайне "Фото" (із стисненням Telegram)
+@dp.message(FormStates.waiting_for_file, F.photo)
+async def download_photo(message: types.Message, state: FSMContext):
+    # Telegram створює кілька копій фото різного розміру, беремо найбільшу (останню в списку)
+    photo = message.photo[-1]
+
+    file_path = os.path.join(DOWNLOADS_DIR, f"{message.from_user.id}_{photo.file_unique_id}.jpg")
+    file_info = await bot.get_file(photo.file_id)
+
+    await bot.download_file(file_info.file_path, destination=file_path)
+
+    await state.clear()
+    await message.answer("✅ Фотографію успішно завантажено!", reply_markup=main_menu)
+    print(f"[ФОТО ЗАВАНТАЖЕНО] Збережено у: {file_path}")
+
+
+# 4. Обробник на випадок, якщо користувач замість файлу надіслав просто текст
+@dp.message(FormStates.waiting_for_file)
+async def file_upload_invalid(message: types.Message):
+    await message.answer("Це не файл. Будь ласка, надішліть документ або фото, або натисніть '❌ Скасувати'.")
+
+
+# --- ОБРОБНИКИ ДЛЯ КНОПОК ВИДАЧІ ІНФОРМАЦІЇ ---
+
+@dp.message(F.text == "📑 2 курс")
+async def send_a(message: types.Message):
+    try:
+        photo = FSInputFile("Екзамен 2 курс.jpg")
+        await message.answer_photo(photo=photo, caption="Ось ")
+    except Exception:
+        await message.answer(" не знайдено.")
+
+@dp.message(F.text == "📑 3 курс")
+async def send_a(message: types.Message):
+    try:
+        photo = FSInputFile("Екзамен 3 курс.jpg")
+        await message.answer_photo(photo=photo, caption="Ось ")
+    except Exception:
+        await message.answer(" не знайдено.")
+
+@dp.message(F.text == "Виховна робота")
+async def send_vr(message: types.Message):
+    await message.answer(
+        "Ось посилання: https://drive.google.com/drive/folders/1rPbmCur2TsaRRGXsxY_wjtDHETNVdLQY?usp=drive_link")
+
+
+@dp.message(F.text == "Осередок доброчесності")
+async def send_od(message: types.Message):
+    await message.answer(
+        "Ось посилання: https://drive.google.com/drive/folders/1aBLGpkVb00kqYTHYEaaa5U5Hk32VUU-C?usp=drive_link")
+
+
+@dp.message(F.text == "ОПП")
+async def send_opp(message: types.Message):
+    specialties = [
+        "Автоматизація та комп’ютерно-інтегровані технології", "Будівництво та експлуатація будівель та споруд",
+        "Облік і оподаткування", "Митна справа в транспортній галузі", "Обслуговування комп’ютерних систем та мереж",
+        "Організація перевезень та управління на залізничному транспорті", "Технічне обслуговування і ремонт вагонів",
+        "Технічне обслуговування та ремонт пристроїв електропостачання залізниць",
+        "Технічне обслуговування, ремонт та експлуатація тягового рухомого складу",
+        "Транспортний менеджмент і логістика"
+    ]
+    await message.answer("\n\n".join(specialties))
+
+
+@dp.message(F.text == "📅 Розклад")
+async def send_rozklad(message: types.Message):
+    await message.answer(
+        "Ось посилання на розклад: https://drive.google.com/file/d/1VFVXP9lFfQDpOnPrOnuNBFHasysS56vq/view?usp=drive_link")
+
+
+@dp.message(F.text == "📅 Військові збори")
+async def send_zboru(message: types.Message):
+    try:
+        # Вказуємо шлях до файлу (він має лежати в тій же папці, що і main.py)
+        photo = FSInputFile("Військові збори.jpg")
+        await message.answer_photo(photo=photo, caption="Ось розклад військових зборів 🫡"
+        )
+    except Exception:
+       await message.answer("⚠️ Не вдалося завантажити картинку. Перевірте, чи є файл 'Військові збори.jpg' у папці з ботом.")
+
+@dp.message(F.text == "📅 Зразок заяви студента")
+async def send_zayva(message: types.Message):
+    try:
+        photo = FSInputFile("Заява 1.jpg")
+        await message.answer_photo(photo=photo, caption="Ось ")
+    except Exception:
+        await message.answer("Графік по коледжу не знайдено.")
+
+@dp.message(F.text == "📅 Зразок заяви батьків")
+async def send_zayva(message: types.Message):
+    try:
+        photo = FSInputFile("Заява батьки.jpg")
+        await message.answer_photo(photo=photo, caption="Ось ")
+    except Exception:
+        await message.answer("Графік по коледжу не знайдено.")
+
+@dp.message(F.text == "📅 Чергування гуртожиток")
+async def send_grafik_gurt(message: types.Message):
+    try:
+        photo = FSInputFile("Графік чергувань_гуртожиток.jpg")
+        await message.answer_photo(photo=photo, caption="Ось графік 🫡")
+    except Exception:
+        await message.answer("Графік по гуртожитку не знайдено.")
+
+
+@dp.message(F.text == "📑 Паспорт кабінету")
+async def send_pasport(message: types.Message):
+    await message.answer(
+        "Ось посилання: https://docs.google.com/document/d/11EI14aeY9mfeIQAjh3-yGHh3bchSBewV/edit?usp=drive_link")
+
+
+@dp.message(F.text == "План роботи кабінету")
+async def send_plankab(message: types.Message):
+    await message.answer(
+        "Ось посилання: https://docs.google.com/document/d/1NqSJo6ZYFUsplH6fwh27vwypGhjyDae_/edit?usp=drive_link")
+
+
+@dp.message(F.text == "План роботи гуртка")
+async def send_plangurt(message: types.Message):
+    await message.answer(
+        "Ось посилання: https://docs.google.com/document/d/18NdN4T_jyaLtO41mNptO04rrKcSGfdKI/edit?usp=drive_link")
+
+
+@dp.message(F.text == "Навчальні плани")
+async def send_np(message: types.Message):
+    await message.answer(
+        "Ось посилання: https://drive.google.com/drive/folders/1rBgBDKGaZn5GBNc-iBUTJer62z1HX6hS?usp=drive_link")
+
+
+# --- ЗАПУСК БОТА ---
+async def main():
+    print("Бот запущений...")
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Бот вимкнений")
